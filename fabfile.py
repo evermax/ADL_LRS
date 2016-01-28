@@ -56,10 +56,10 @@ def setup_lrs():
     print "If you see an error code 23 while running rync it's only because there were no files to sync in the django_extensions directory. \
     That occurs when the files are where they are supposed to be in the first place."
     # Fixes admin templates for django
-    local('rsync -av ../env/django_extensions/ ../env/local/lib/python2.7/site-packages/django_extensions/')
+    local('rsync -av ../env/django_extensions/ ../env/lib/python2.7/site-packages/django_extensions/')
     local('rm -rf ../env/django_extensions/')
 
-    local('rsync -av ../env/django/ ../env/local/lib/python2.7/site-packages/django/')
+    local('rsync -av ../env/django/ ../env/lib/python2.7/site-packages/django/')
     local('rm -rf ../env/django/')
 
 
