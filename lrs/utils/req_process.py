@@ -1,10 +1,9 @@
 import json
 import uuid
 import copy
-from base64 import b64decode
 from datetime import datetime
 
-from django.http import HttpResponse, HttpResponseNotFound
+from django.http import HttpResponse, HttpResponseNotFound, JsonResponse
 from django.conf import settings
 from django.utils.timezone import utc
 
@@ -14,12 +13,12 @@ from ..managers.ActivityProfileManager import ActivityProfileManager
 from ..managers.ActivityStateManager import ActivityStateManager 
 from ..managers.AgentProfileManager import AgentProfileManager
 from ..managers.StatementManager import StatementManager
-from ..tasks import check_activity_metadata, void_statements
+from ..tasks import check_activity_metadata, void_statements, check_statement_hooks
 
 def process_statement(stmt, auth, version, payload_sha2s):
     # Add id to statement if not present
     if not 'id' in stmt:
-        stmt['id'] = str(uuid.uuid1())
+        stmt['id'] = str(uuid.uuid4())
 
     # Add version to statement if not present
     if not 'version' in stmt:
@@ -39,7 +38,7 @@ def process_statement(stmt, auth, version, payload_sha2s):
                     stmt['object']['context']['contextActivities'][k] = [v]
 
     # Add stored time
-    stmt['stored'] = str(datetime.utcnow().replace(tzinfo=utc).isoformat())
+    stmt['stored'] = datetime.utcnow().replace(tzinfo=utc).isoformat()
 
     # Add stored as timestamp if timestamp not present
     if not 'timestamp' in stmt:
@@ -109,7 +108,6 @@ def process_complex_get(req_dict):
     else:
         if isinstance(stmt_result, dict):
             stmt_result = json.dumps(stmt_result)
-
         resp = HttpResponse(stmt_result, content_type=mime_type, status=200)    
     return resp, content_length
 
@@ -123,21 +121,25 @@ def statements_post(req_dict):
 
     stmt_responses = process_body(body, auth, req_dict['headers']['X-Experience-API-Version'], req_dict.get('payload_sha2s', None))
     stmt_ids = [stmt_tup[0] for stmt_tup in stmt_responses]
-    stmts_to_void = [stmt_tup[1] for stmt_tup in stmt_responses if stmt_tup[1]]
+    stmts_to_void = [str(stmt_tup[1]) for stmt_tup in stmt_responses if stmt_tup[1]]
     check_activity_metadata.delay(stmt_ids)
     if stmts_to_void:
         void_statements.delay(stmts_to_void)
-    return HttpResponse(json.dumps([st for st in stmt_ids]), mimetype="application/json", status=200)
+    if settings.USE_HOOKS:
+        check_statement_hooks.delay(stmt_ids)
+    return JsonResponse([st for st in stmt_ids], safe=False)
 
 def statements_put(req_dict):
     auth = req_dict['auth']
     # Since it is single stmt put in list
     stmt_responses = process_body([req_dict['body']], auth, req_dict['headers']['X-Experience-API-Version'], req_dict.get('payload_sha2s', None))
     stmt_ids = [stmt_tup[0] for stmt_tup in stmt_responses]
-    stmts_to_void = [stmt_tup[1] for stmt_tup in stmt_responses if stmt_tup[1]]
+    stmts_to_void = [str(stmt_tup[1]) for stmt_tup in stmt_responses if stmt_tup[1]]
     check_activity_metadata.delay(stmt_ids)
     if stmts_to_void:
-        void_statements.delay(stmts_to_void)       
+        void_statements.delay(stmts_to_void)  
+    if settings.USE_HOOKS:
+        check_statement_hooks.delay(stmt_ids)
     return HttpResponse("No Content", status=204)
 
 def statements_more_get(req_dict):
@@ -183,8 +185,7 @@ def statements_get(req_dict):
             resp, content_length = process_complex_get(req_dict)
         else:
             st = Statement.objects.get(statement_id=req_dict['statementId'])
-            
-            stmt_result = json.dumps(st.to_dict(format=req_dict['params']['format']), sort_keys=False)
+            stmt_result = json.dumps(st.to_dict(ret_format=req_dict['params']['format']), sort_keys=False)
             resp = HttpResponse(stmt_result, content_type=mime_type, status=200)
             content_length = len(stmt_result)
     # Complex GET
@@ -202,7 +203,6 @@ def statements_get(req_dict):
     # If it's a HEAD request
     if req_dict['method'].lower() != 'get':
         resp.body = ''
-
     return resp
 
 def build_response(stmt_result):
@@ -220,7 +220,7 @@ def build_response(stmt_result):
             if st_atts:
                 for att in st_atts.all():
                     if att.payload:
-                        sha2s.append((att.sha2, att.payload, att.contentType))
+                        sha2s.append((att.canonical_data['sha2'], att.payload, att.canonical_data['contentType']))
     # If attachments have payloads
     if sha2s:
         # Create multipart message and attach json message to it
@@ -244,15 +244,14 @@ def build_response(stmt_result):
             try:
                 # Default chunk size is 64kb
                 for chunk in sha2[1].chunks():
-                    decoded_data = b64decode(chunk)
-                    chunks.append(decoded_data)
+                    chunks.append(chunk)                    
             except OSError:
                 raise OSError(2, "No such file or directory", sha2[1].name.split("/")[1])
             string_list.append("".join(chunks) + line_feed)
         
         string_list.append("--" + boundary + "--") 
         mime_type = "multipart/mixed; boundary=" + boundary
-        attachment_body = "".join([s for s in string_list])
+        attachment_body = "".join([str(s) for s in string_list])
         return attachment_body, mime_type, len(attachment_body)
     # Has attachments but no payloads so just dump the stmt_result
     else:
@@ -301,12 +300,11 @@ def activity_state_get(req_dict):
         else:
             since = req_dict['params'].get('since', None)
             resource = actstate.get_state_ids(activity_id, registration, since)
-            response = HttpResponse(json.dumps([k for k in resource]), content_type="application/json")
+            response = JsonResponse([k for k in resource], safe=False)
     
     # If it's a HEAD request
     if req_dict['method'].lower() != 'get':
         response.body = ''
-
     return response
 
 def activity_state_delete(req_dict):
@@ -338,32 +336,31 @@ def activity_profile_get(req_dict):
     # Instantiate ActivityProfile
     ap = ActivityProfileManager()
     # Get profileId and activityId
-    profileId = req_dict['params'].get('profileId', None) if 'params' in req_dict else None
-    activityId = req_dict['params'].get('activityId', None) if 'params' in req_dict else None
+    profile_id = req_dict['params'].get('profileId', None) if 'params' in req_dict else None
+    activity_id = req_dict['params'].get('activityId', None) if 'params' in req_dict else None
     
     #If the profileId exists, get the profile and return it in the response
-    if profileId:
-        resource = ap.get_profile(profileId, activityId)
+    if profile_id:
+        resource = ap.get_profile(profile_id, activity_id)
         if resource.profile:
             try:
                 response = HttpResponse(resource.profile.read(), content_type=resource.content_type)
             except IOError:
-                response = HttpResponseNotFound("Error reading file, could not find: %s" % profileId)
+                response = HttpResponseNotFound("Error reading file, could not find: %s" % profile_id)
         else:
-            response = HttpResponse(resource.json_profile, content_type=resource.content_type)            
+            response = HttpResponse(resource.json_profile, content_type=resource.content_type)
         response['ETag'] = '"%s"' % resource.etag
         return response
 
     #Return IDs of profiles stored since profileId was not submitted
     since = req_dict['params'].get('since', None) if 'params' in req_dict else None
-    resource = ap.get_profile_ids(activityId, since)
-    response = HttpResponse(json.dumps([k for k in resource]), content_type="application/json")
+    resource = ap.get_profile_ids(activity_id, since)
+    response = JsonResponse([k for k in resource], safe=False)
     response['since'] = since
     
     # If it's a HEAD request
     if req_dict['method'].lower() != 'get':
         response.body = ''
-
     return response
 
 def activity_profile_delete(req_dict):
@@ -374,15 +371,14 @@ def activity_profile_delete(req_dict):
     return HttpResponse('', status=204)
 
 def activities_get(req_dict):
-    activityId = req_dict['params']['activityId']
-    act = Activity.objects.get(activity_id=activityId, authority__isnull=False)
-    return_act = json.dumps(act.to_dict('all'), sort_keys=False)    
-    resp = HttpResponse(return_act, mimetype="application/json", status=200)
+    activity_id = req_dict['params']['activityId']
+    act = Activity.objects.get(activity_id=activity_id, authority__isnull=False)
+    return_act = json.dumps(act.return_activity_with_lang_format('all'), sort_keys=False)    
+    resp = HttpResponse(return_act, content_type="application/json", status=200)
     resp['Content-Length'] = str(len(return_act))
     # If it's a HEAD request
     if req_dict['method'].lower() != 'get':
         resp.body = ''
-
     return resp
 
 def agent_profile_post(req_dict):
@@ -412,24 +408,23 @@ def agent_profile_get(req_dict):
     else:
         ap = AgentProfileManager(a)
 
-        profileId = req_dict['params'].get('profileId', None) if 'params' in req_dict else None
-        if profileId:
-            resource = ap.get_profile(profileId)
+        profile_id = req_dict['params'].get('profileId', None) if 'params' in req_dict else None
+        if profile_id:
+            resource = ap.get_profile(profile_id)
             if resource.profile:
                 response = HttpResponse(resource.profile.read(), content_type=resource.content_type)
             else:
-                response = HttpResponse(resource.json_profile, content_type=resource.content_type)            
+                response = HttpResponse(resource.json_profile, content_type=resource.content_type)
             response['ETag'] = '"%s"' % resource.etag
             return response
 
         since = req_dict['params'].get('since', None) if 'params' in req_dict else None
         resource = ap.get_profile_ids(since)
-        response = HttpResponse(json.dumps([k for k in resource]), content_type="application/json")
+        response = JsonResponse([k for k in resource], safe=False)
     
     # If it's a HEAD request
     if req_dict['method'].lower() != 'get':
         response.body = ''
-
     return response
 
 def agent_profile_delete(req_dict):
@@ -437,16 +432,16 @@ def agent_profile_delete(req_dict):
     a = Agent.objects.retrieve(**agent)
     if not a:
         return HttpResponse('', status=204)
-    profileId = req_dict['params']['profileId']
+    profile_id = req_dict['params']['profileId']
     ap = AgentProfileManager(a)
-    ap.delete_profile(profileId)
+    ap.delete_profile(profile_id)
 
     return HttpResponse('', status=204)
 
 def agents_get(req_dict):
     a = Agent.objects.get(**req_dict['agent_ifp'])    
     agent_data = json.dumps(a.to_dict_person(), sort_keys=False)
-    resp = HttpResponse(agent_data, mimetype="application/json")
+    resp = HttpResponse(agent_data, content_type="application/json", status=200)
     resp['Content-Length'] = str(len(agent_data))
     # If it's a HEAD request
     if req_dict['method'].lower() != 'get':

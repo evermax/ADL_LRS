@@ -1,25 +1,26 @@
+import ast
+import base64
 import email
 import urllib
 import json
 import itertools
-from base64 import b64decode, b64encode
 from isodate.isoerror import ISO8601Error
 from isodate.isodatetime import parse_datetime
+from Crypto.PublicKey import RSA
+from jose import jws
 
-from django.core.cache import get_cache
+from django.core.cache import caches
 from django.http import QueryDict
 
 from . import convert_to_datatype, convert_post_body_to_dict
 from etag import get_etag_info
-from jws import JWS, JWSException
 from ..exceptions import OauthUnauthorized, OauthBadRequest, ParamError, BadRequest
 
 from oauth_provider.utils import get_oauth_request, require_params
 from oauth_provider.decorators import CheckOauth
 from oauth_provider.store import store
-from oauth2_provider.provider.oauth2.models import AccessToken
 
-att_cache = get_cache('attachment_cache')  
+att_cache = caches['attachment_cache']  
 
 def parse(request, more_id=None):
     # Parse request into body, headers, and params
@@ -119,21 +120,12 @@ def set_normal_authorization(request, r_dict):
         r_dict['auth']['oauth_consumer'] = consumer
         r_dict['auth']['oauth_token'] = token
         r_dict['auth']['type'] = 'oauth'
-    elif auth_params[:7] == 'Bearer ':
-        try:
-            access_token = AccessToken.objects.get(token=auth_params[7:])
-        except AccessToken.DoesNotExist:
-            raise OauthUnauthorized("Access Token does not exist")
-        else:
-            if access_token.get_expire_delta() <= 0:
-                raise OauthUnauthorized('Access Token has expired')
-            r_dict['auth']['oauth_token'] = access_token
-            r_dict['auth']['type'] = 'oauth2'
     else:        
         r_dict['auth']['type'] = 'http'
 
-def parse_normal_body(request, r_dict):
-    if request.method == 'POST' or request.method == 'PUT':
+def parse_post_put_body(request, r_dict):
+    # If there is no body, django test client won't send a content type
+    if r_dict['headers']['CONTENT_TYPE']:
         # If it is multipart/mixed we're expecting attachment data (also for signed statements)
         if 'multipart/mixed' in r_dict['headers']['CONTENT_TYPE']: 
             parse_attachment(request, r_dict)
@@ -218,8 +210,12 @@ def parse_cors_request(request, r_dict):
     set_agent_param(r_dict)
 
 def parse_normal_request(request, r_dict):
-    r_dict = parse_normal_body(request, r_dict)
-    # Update dict with any GET data
+    if request.method == 'POST' or request.method == 'PUT':    
+        r_dict = parse_post_put_body(request, r_dict)
+    elif request.method == 'DELETE':
+        # Delete can have data which will be in parameter or get params
+        if request.body != '':
+            r_dict['params'].update(ast.literal_eval(request.body))
     r_dict['params'].update(request.GET.dict())
     set_agent_param(r_dict)
 
@@ -231,25 +227,24 @@ def parse_attachment(request, r_dict):
             message = "Content-Type:" + r_dict['headers']['CONTENT_TYPE'] + "\r\n" + message
         else:
             raise BadRequest("Could not find the boundary for the multipart content")
-
     msg = email.message_from_string(message)
     if msg.is_multipart():
         parts = msg.get_payload()
         stmt_part = parts.pop(0)
         if stmt_part['Content-Type'] != "application/json":
             raise ParamError("Content-Type of statement was not application/json")
-
         try:
             r_dict['body'] = json.loads(stmt_part.get_payload())
         except Exception:
             raise ParamError("Statement was not valid JSON")
-
         # Find the signature sha2 from the list attachment values in the statements (there should only be one)
         if isinstance(r_dict['body'], list):
-            signature_att = list(itertools.chain(*[[a.get('sha2', None) for a in s['attachments'] if a.get('usageType', None) == "http://adlnet.gov/expapi/attachments/signature"] for s in r_dict['body'] if 'attachments' in s]))
+            signature_att = list(itertools.chain(*[[a.get('sha2', None) for a in s['attachments'] if a.get('usageType', None) == "http://adlnet.gov/expapi/attachments/signature"] \
+                for s in r_dict['body'] if 'attachments' in s]))
         else:        
-            signature_att = [a.get('sha2', None) for a in r_dict['body']['attachments'] if a.get('usageType', None) == "http://adlnet.gov/expapi/attachments/signature" and 'attachments' in r_dict['body']]
-
+            signature_att = [a.get('sha2', None) for a in r_dict['body']['attachments'] if a.get('usageType', None) == "http://adlnet.gov/expapi/attachments/signature" \
+                and 'attachments' in r_dict['body']]
+        
         # Get all sha2s from the request
         payload_sha2s = [p.get('X-Experience-API-Hash', None) for p in msg.get_payload()]
         # Check each sha2 in payload, if even one of them is None then there is a missing hash
@@ -264,39 +259,93 @@ def parse_attachment(request, r_dict):
                     raise BadRequest("Signature attachment is missing from request")
             else:
                 raise BadRequest("Signature attachment is missing from request")   
-
-        # We know all sha2s are there so set it and loop through each payload
+        # We know all sha2s are there so set it and loop through each payload and save to cache
         r_dict['payload_sha2s'] = payload_sha2s
-        for part in msg.get_payload():
-            xhash = part.get('X-Experience-API-Hash')
-            c_type = part['Content-Type']
-            # Payloads are base64 encoded implictly from email lib (except for plaintext)
-            if "text/plain" in c_type:
-                payload = b64encode(part.get_payload())
-            else:
-                payload = part.get_payload()
-            att_cache.set(xhash, payload)
+        temp_save_attachments(msg)
     else:
         raise ParamError("This content was not multipart for the multipart request.")
-    # See if the posted statements have attachments
+    # See if the posted statements have signatures
+    validate_signatures(r_dict['body'])
+
+def validate_signatures(body):
     att_stmts = []
-    if isinstance(r_dict['body'], list):
-        for s in r_dict['body']:
+    if isinstance(body, list):
+        for s in body:
             if 'attachments' in s:
                 att_stmts.append(s)
-    elif 'attachments' in r_dict['body']:
-        att_stmts.append(r_dict['body'])
+    elif 'attachments' in body:
+        att_stmts.append(body)
     if att_stmts:
         # find if any of those statements with attachments have a signed statement
         signed_stmts = [(s,a) for s in att_stmts for a in s.get('attachments', None) if a['usageType'] == "http://adlnet.gov/expapi/attachments/signature"]
         for ss in signed_stmts:
-            attmnt = b64decode(att_cache.get(ss[1]['sha2']))
-            jws = JWS(jws=attmnt)
-            try:
-                if not jws.verify() or not jws.validate(ss[0]):
-                    raise BadRequest("The JSON Web Signature is not valid")
-            except JWSException as jwsx:
-                raise BadRequest(jwsx)
+            sha2_key = ss[1]['sha2']
+            signature = att_cache.get(sha2_key)
+            algorithm = jws.get_unverified_headers(signature).get('alg', None)
+            x5c = jws.get_unverified_headers(signature).get('x5c', None)
+            jws_payload = jws.get_unverified_claims(signature)
+            body_payload = ss[0]
+            # If x.509 was used to sign, the public key should be in the x5c header and you need to verify it
+            # If using RS256, RS384, or RS512 some JWS libs require a real private key to create JWS - xAPI spec
+            # only has SHOULD - need to look into. If x.509 is necessary then if no x5c header is found this should fail
+            if x5c:
+                verified = False
+                try:
+                    verified = jws.verify(signature, cert_to_key(x5c[0]), algorithm)
+                except Exception, e:
+                    att_cache.delete(sha2_key)
+                    raise BadRequest("The JWS is not valid: %s" % e.message)
+                else:
+                    if not verified:
+                        att_cache.delete(sha2_key)
+                        raise BadRequest("The JWS is not valid - could not verify signature")                
+                    # Compare statements
+                    if not compare_payloads(jws_payload, body_payload):
+                        att_cache.delete(sha2_key)
+                        raise BadRequest("The JWS is not valid - payload and body statements do not match")                    
+            else:
+                # Compare statements
+                if not compare_payloads(jws_payload, body_payload):
+                    att_cache.delete(sha2_key)
+                    raise BadRequest("The JWS is not valid - payload and body statements do not match")    
+
+def compare_payloads(jws_payload, body_payload):
+    # Need to copy the dict so use dict()
+    jws_placeholder = dict(json.loads(jws_payload))
+    jws_placeholder.pop("id", None)
+    jws_placeholder.pop("authority", None)
+    jws_placeholder.pop("stored", None)
+    jws_placeholder.pop("timestamp", None)
+    jws_placeholder.pop("version", None)
+    jws_placeholder.pop("attachments", None)
+    body_placeholder = dict(body_payload)
+    body_placeholder.pop("id", None)
+    body_placeholder.pop("authority", None)
+    body_placeholder.pop("stored", None)
+    body_placeholder.pop("timestamp", None)
+    body_placeholder.pop("version", None)
+    body_placeholder.pop("attachments", None)
+    
+    return json.dumps(jws_placeholder, sort_keys=True) == json.dumps(body_placeholder, sort_keys=True)
+
+def temp_save_attachments(msg):
+    for part in msg.get_payload():
+        xhash = part.get('X-Experience-API-Hash')
+        c_type = part['Content-Type']
+        encoding = part.get('Content-Transfer-Encoding', None)
+        if encoding != "binary":
+            raise BadRequest("Each attachment part should have 'binary' as Content-Transfer-Encoding")            
+        # Plaintext payloads from email lib have extra newline appended
+        if "text/plain" in c_type:
+            payload = part.get_payload()
+            if payload.endswith('\n'):
+                payload = payload[:-1]
+        else:
+            payload = part.get_payload()
+        att_cache.set(xhash, payload)
+
+def cert_to_key(cert):
+    return RSA.importKey(base64.b64decode(cert))
 
 def get_endpoint(request):
     # Used for OAuth scope

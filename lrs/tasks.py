@@ -4,6 +4,8 @@ import urllib2
 import json
 import hmac
 import requests
+import uuid
+from hashlib import sha1
 
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
@@ -24,7 +26,7 @@ def check_activity_metadata(stmts):
     [get_activity_metadata(a_id) for a_id in activity_ids]
 
 @shared_task
-@transaction.commit_on_success
+@transaction.atomic
 def void_statements(stmts):
     from .models import Statement    
     try:
@@ -35,20 +37,22 @@ def void_statements(stmts):
 @shared_task
 def check_statement_hooks(stmt_ids):
     try:
-        from .models import Hook, Statement
+        from .models import Statement
+        from adl_lrs.models import Hook
         hooks = Hook.objects.all().values_list('hook_id', 'filters', 'config')
         for h in hooks:
             filters = h[1]
             config = h[2]
             secret = config['secret'] if 'secret' in config else False
+            stmt_ids = [uuid.UUID(st) for st in stmt_ids]
             filterQ = parse_filter(filters, Q()) & Q(statement_id__in=stmt_ids)
             found = Statement.objects.filter(filterQ).distinct()
             if found:
                 if config['content_type'] == 'json':
-                    data = '{"statements": [%s], "id": "%s"}' % (",".join(stmt for stmt in found.values_list('full_statement', flat=True)), h[0])
+                    data = '{"statements": [%s], "id": "%s"}' % (",".join(json.dumps(stmt) for stmt in found.values_list('full_statement', flat=True)), str(h[0]))
                     headers = {'Content-Type': 'application/json'}
                 else:
-                    data = 'payload={"statements": [%s], "id": "%s"}' % (",".join(stmt for stmt in found.values_list('full_statement', flat=True)), h[0])
+                    data = 'payload={"statements": [%s], "id": "%s"}' % (",".join(json.dumps(stmt) for stmt in found.values_list('full_statement', flat=True)), str(h[0]))
                     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
                 try:
                     if secret:
@@ -205,7 +209,7 @@ def get_activity_metadata(act_id):
             if valid_url_data:
                 update_activity_definition(fake_activity)
 
-@transaction.commit_on_success
+@transaction.atomic
 def update_activity_definition(act):
     from .models import Activity
     # Try to get activity by id
@@ -216,21 +220,5 @@ def update_activity_definition(act):
         pass
     # If the activity already exists in the db
     else:
-        # If there is a name in the IRI act definition add it to what already exists
-        if 'name'in act['definition']:
-            activity.activity_definition_name = dict(activity.activity_definition_name.items() + act['definition']['name'].items())
-        # If there is a description in the IRI act definition add it to what already exists
-        if 'description' in act['definition']:
-            activity.activity_definition_description = dict(activity.activity_definition_description.items() + act['definition']['description'].items())
-
-        activity.activity_definition_type = act['definition'].get('type', '')
-        activity.activity_definition_moreInfo = act['definition'].get('moreInfo', '')
-        activity.activity_definition_interactionType = act['definition'].get('interactionType', '')
-        activity.activity_definition_extensions = act['definition'].get('extensions', {})
-        activity.activity_definition_crpanswers = act['definition'].get('correctResponsesPattern', {})
-        activity.activity_definition_choices = act['definition'].get('choices', {})
-        activity.activity_definition_sources = act['definition'].get('source', {}) 
-        activity.activity_definition_targets = act['definition'].get('target', {})
-        activity.activity_definition_steps = act['definition'].get('steps', {})
-        activity.activity_definition_scales = act['definition'].get('scale', {})
+        activity.canonical_data = dict(activity.canonical_data.items() + act.items())
         activity.save()

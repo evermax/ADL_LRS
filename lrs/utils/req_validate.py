@@ -1,6 +1,7 @@
 import json
 from isodate.isodatetime import parse_datetime
 from isodate.isoerror import ISO8601Error
+import uuid
 
 from . import get_agent_ifp
 from authorization import auth
@@ -46,17 +47,6 @@ def validate_void_statement(void_id):
         if stmts[0].voided:
             err_msg = "Statement with ID: %s is already voided, cannot unvoid. Please re-issue the statement under a new ID." % void_id
             raise BadRequest(err_msg)
-            
-def validate_stmt_authority(stmt, auth):
-    # If not validated yet - validate auth first since it supercedes any auth in stmt
-    if auth['agent']:
-        if auth['agent'].objectType == 'Group' and not auth['agent'].oauth_identifier:
-            err_msg = "Statements cannot have a non-Oauth group as the authority"
-            raise ParamError(err_msg)
-        elif auth['agent'].objectType == 'Group' and auth['agent'].oauth_identifier:
-            if auth['agent'].member.count() != 2:
-                err_msg = "OAuth authority must only contain 2 members"
-                raise ParamError(err_msg)
 
 def validate_body(body, auth, payload_sha2s, content_type):
         [server_validate_statement(stmt, auth, payload_sha2s, content_type) for stmt in body]
@@ -71,7 +61,6 @@ def server_validate_statement(stmt, auth, payload_sha2s, content_type):
     if stmt['verb']['id'] == 'http://adlnet.gov/expapi/verbs/voided':
         validate_void_statement(stmt['object']['id'])
 
-    validate_stmt_authority(stmt, auth)
     if 'attachments' in stmt:
         attachment_data = stmt['attachments']
         validate_attachments(attachment_data, payload_sha2s, content_type)
@@ -125,8 +114,9 @@ def validate_statementId(req_dict):
 
     # Try to retrieve stmt, if DNE then return empty else return stmt info                
     try:
-        st = Statement.objects.get(statement_id=statementId)
-    except Statement.DoesNotExist:
+        uuidId = uuid.UUID(str(statementId))
+        st = Statement.objects.get(statement_id=uuidId)
+    except (Statement.DoesNotExist, ValueError):
         err_msg = 'There is no statement associated with the id: %s' % statementId
         raise IDNotFoundError(err_msg)
 
@@ -459,8 +449,8 @@ def activity_profile_post(req_dict):
     # Check the content type if the document already exists 
     exists = False
     try:
-        p = ActivityProfile.objects.get(activityId=req_dict['params']['activityId'], 
-            profileId=req_dict['params']['profileId'])
+        p = ActivityProfile.objects.get(activity_id=req_dict['params']['activityId'], 
+            profile_id=req_dict['params']['profileId'])
         exists = True
     except ActivityProfile.DoesNotExist:
         pass
@@ -546,16 +536,16 @@ def activities_get(req_dict):
         raise ParamError("The get activities request contained unexpected parameters: %s" % ", ".join(rogueparams))
 
     try:
-        activityId = req_dict['params']['activityId']
+        activity_id = req_dict['params']['activityId']
     except KeyError:
         err_msg = "Error -- activities - method = %s, but activityId parameter is missing" % req_dict['method']
         raise ParamError(err_msg)
 
     # Try to retrieve activity, if DNE then return empty else return activity info
     try:
-        Activity.objects.get(activity_id=activityId, authority__isnull=False)
+        Activity.objects.get(activity_id=activity_id, authority__isnull=False)
     except Activity.DoesNotExist:    
-        err_msg = "No activity found with ID %s" % activityId
+        err_msg = "No activity found with ID %s" % activity_id
         raise IDNotFoundError(err_msg)
 
     return req_dict
@@ -595,7 +585,7 @@ def agent_profile_post(req_dict):
     agent = req_dict['params']['agent']
     a = Agent.objects.retrieve_or_create(**agent)[0]   
     try:
-        p = AgentProfile.objects.get(profileId=req_dict['params']['profileId'],agent=a)
+        p = AgentProfile.objects.get(profile_id=req_dict['params']['profileId'],agent=a)
         exists = True
     except AgentProfile.DoesNotExist:
         pass

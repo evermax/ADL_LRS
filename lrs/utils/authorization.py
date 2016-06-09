@@ -10,7 +10,9 @@ from ..exceptions import Unauthorized, BadRequest, Forbidden
 from ..models import Agent
 
 from oauth_provider.models import Consumer
-from oauth2_provider.provider.oauth2.models import Client
+from oauth_provider.utils import get_oauth_request, require_params
+from oauth_provider.decorators import CheckOauth
+from oauth_provider.store import store
 
 # A decorator, that can be used to authenticate some requests at the site.
 def auth(func):
@@ -24,11 +26,63 @@ def auth(func):
             http_auth_helper(request)
         elif auth_type == 'oauth' and settings.OAUTH_ENABLED: 
             oauth_helper(request)
-        elif auth_type == 'oauth2' and settings.OAUTH_ENABLED:
-            oauth_helper(request, 2)
         # There is an oauth auth_type request and oauth is not enabled
-        elif (auth_type == 'oauth' or auth_type == 'oauth2') and not settings.OAUTH_ENABLED: 
+        elif (auth_type == 'oauth') and not settings.OAUTH_ENABLED: 
             raise BadRequest("OAuth is not enabled. To enable, set the OAUTH_ENABLED flag to true in settings")
+        return func(request, *args, **kwargs)
+    return inner
+
+# Decorater used for non-xapi endpoints
+def non_xapi_auth(func):
+    @wraps(func)
+    def inner(request, *args, **kwargs):
+        auth = None
+        if 'HTTP_AUTHORIZATION' in request.META:
+            auth = request.META.get('HTTP_AUTHORIZATION')
+        elif 'Authorization' in request.META:
+            auth = request.META.get('Authorization')
+        elif request.user:
+            auth = request.user
+        if auth:
+            if isinstance(auth, basestring):
+                if auth[:6] == 'OAuth ':
+                    oauth_request = get_oauth_request(request)
+                    # Returns HttpBadRequest if missing any params
+                    missing = require_params(oauth_request)
+                    if missing:
+                        raise missing
+
+                    check = CheckOauth()
+                    e_type, error = check.check_access_token(request)
+                    if e_type and error:
+                        if e_type == 'auth':
+                            raise OauthUnauthorized(error)
+                        else:
+                            raise OauthBadRequest(error)
+                    # Consumer and token should be clean by now
+                    consumer = store.get_consumer(request, oauth_request, oauth_request['oauth_consumer_key'])
+                    token = store.get_access_token(request, oauth_request, consumer, oauth_request.get_parameter('oauth_token'))
+                    request.META['lrs-user'] = token.user
+                else:
+                    auth = auth.split()
+                    if len(auth) == 2:
+                        if auth[0].lower() == 'basic':
+                            uname, passwd = base64.b64decode(auth[1]).split(':')
+                            if uname and passwd:
+                                user = authenticate(username=uname, password=passwd)
+                                if not user:
+                                    request.META['lrs-user'] = (False, "Unauthorized: Authorization failed, please verify your username and password")
+                                request.META['lrs-user'] = (True, user)
+                            else:
+                                request.META['lrs-user'] = (False, "Unauthorized: The format of the HTTP Basic Authorization Header value is incorrect")
+                        else:
+                            request.META['lrs-user'] = (False, "Unauthorized: HTTP Basic Authorization Header must start with Basic")
+                    else:
+                        request.META['lrs-user'] = (False, "Unauthorized: The format of the HTTP Basic Authorization Header value is incorrect")
+            else:
+                request.META['lrs-user'] = (True, '')
+        else:
+            request.META['lrs-user'] = (False, "Unauthorized: Authorization must be supplied")
         return func(request, *args, **kwargs)
     return inner
 
@@ -38,19 +92,12 @@ def get_user_from_auth(auth):
     if type(auth) ==  User:
         return auth #it is a User already
     else:
-        oauth = 1
         # it's a group.. gotta find out which of the 2 members is the client
         for member in auth.member.all():
             if member.account_name: 
                 key = member.account_name
-                if 'oauth2' in member.account_homePage.lower():
-                    oauth = 2
                 break
-        # get consumer/client based on oauth version
-        if oauth == 1:
-            user = Consumer.objects.get(key__exact=key).user
-        else:
-            user = Client.objects.get(client_id__exact=key).user
+        user = Consumer.objects.get(key__exact=key).user
     return user
 
 def validate_oauth_scope(req_dict):
@@ -133,7 +180,7 @@ def http_auth_helper(request):
                         # If the user successfully logged in, then add/overwrite
                         # the user object of this request.
                         request['auth']['user'] = user
-                        request['auth']['agent'] = Agent.objects.retrieve_or_create(**{'name':user.username, 'mbox':'mailto:%s' % user.email, 'objectType': 'Agent'})[0]
+                        request['auth']['agent'] = user.agent
                     else:
                         raise Unauthorized("Authorization failed, please verify your username and password")
                 request['auth']['define'] = True
@@ -145,7 +192,7 @@ def http_auth_helper(request):
         # The username/password combo was incorrect, or not provided.
         raise Unauthorized("Authorization header missing")
 
-def oauth_helper(request, version=1):
+def oauth_helper(request):
     token = request['auth']['oauth_token']
     user = token.user
     user_name = user.username
@@ -154,19 +201,15 @@ def oauth_helper(request, version=1):
     else:
         user_email = 'mailto:%s' % user.email
 
-    if version == 1 :
-        consumer = token.consumer                
-    else:
-        consumer = token.client
+    consumer = token.consumer
     members = [
                 {
                     "account":{
-                                "name":consumer.key if version == 1 else consumer.client_id,
-                                "homePage":"%s://%s/XAPI/OAuth/token/" % (settings.SITE_SCHEME, str(Site.objects.get_current().domain)) if version == 1 else \
-                                "%s://%s/XAPI/oauth2/access_token/" % (settings.SITE_SCHEME, str(Site.objects.get_current().domain))
+                                "name":consumer.key,
+                                "homePage":"%s://%s/XAPI/OAuth/token/" % (settings.SITE_SCHEME, str(Site.objects.get_current().domain))
                     },
                     "objectType": "Agent",
-                    "oauth_identifier": "anonoauth:%s" % consumer.key if version == 1 else consumer.client_id
+                    "oauth_identifier": "anonoauth:%s" % consumer.key
                 },
                 {
                     "name":user_name,
@@ -174,7 +217,7 @@ def oauth_helper(request, version=1):
                     "objectType": "Agent"
                 }
     ]
-    kwargs = {"objectType":"Group", "member":members, "oauth_identifier": "anongroup:%s-%s" % (consumer.key if version == 1 else consumer.client_id, user_email)}
+    kwargs = {"objectType":"Group", "member":members, "oauth_identifier": "anongroup:%s-%s" % (consumer.key, user_email)}
     # create/get oauth group and set in dictionary
     oauth_group, created = Agent.objects.oauth_group(**kwargs)
     request['auth']['agent'] = oauth_group

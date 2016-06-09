@@ -1,13 +1,11 @@
 import os
 import sys
-import linecache
 from fabric.api import local
 
 def setup_env():
     INSTALL_STEPS = ['virtualenv ../env;. ../env/bin/activate;pip install -r requirements.txt;deactivate']
     for step in INSTALL_STEPS:
         local(step)
-
 
 def setup_lrs():
     # Media folder names
@@ -30,6 +28,22 @@ def setup_lrs():
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
 
+    celery_log_dir = os.path.join(log_dir, 'celery')
+    if not os.path.exists(celery_log_dir):
+        os.makedirs(celery_log_dir)
+
+    supervisord_log_dir = os.path.join(log_dir, 'supervisord')
+    if not os.path.exists(supervisord_log_dir):
+        os.makedirs(supervisord_log_dir)
+
+    uwsgi_log_dir = os.path.join(log_dir, 'uwsgi')
+    if not os.path.exists(uwsgi_log_dir):
+        os.makedirs(uwsgi_log_dir)
+
+    nginx_log_dir = os.path.join(log_dir, 'nginx')
+    if not os.path.exists(nginx_log_dir):
+        os.makedirs(nginx_log_dir)
+
     # Add settings module so fab file can see it
     os.environ['DJANGO_SETTINGS_MODULE'] = "adl_lrs.settings"
     from django.conf import settings
@@ -49,19 +63,11 @@ def setup_lrs():
         os.makedirs(os.path.join(adldir,statement_attachments))
 
     # Create cache tables and sync the db
-    local('./manage.py createcachetable cache_statement_list')
-    local('./manage.py createcachetable attachment_cache')
-    local('./manage.py syncdb')
-
-    print "If you see an error code 23 while running rync it's only because there were no files to sync in the django_extensions directory. \
-    That occurs when the files are where they are supposed to be in the first place."
-    # Fixes admin templates for django
-    local('rsync -av ../env/django_extensions/ ../env/lib/python2.7/site-packages/django_extensions/')
-    local('rm -rf ../env/django_extensions/')
-
-    local('rsync -av ../env/django/ ../env/lib/python2.7/site-packages/django/')
-    local('rm -rf ../env/django/')
-
+    local('./manage.py createcachetable')
+    local('./manage.py migrate')
+    local('./manage.py makemigrations adl_lrs lrs oauth_provider')
+    local('./manage.py migrate')
+    local('./manage.py createsuperuser')
 
 def test_lrs():
-    local('./manage.py test lrs')
+    local('./manage.py test lrs.tests')
